@@ -1,23 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import requests
 from bs4 import BeautifulSoup
-import time
+import feedparser
 from typing import List, Dict, Any
 import logging
-import os
+import re
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="LinkedIn Job Scraper API",
-    description="API for scraping job listings from LinkedIn",
+    description="API for scraping job listings using RSS feeds",
     version="1.0.0"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,151 +24,155 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Try to import undetected_chromedriver, but provide fallback
-try:
-    import undetected_chromedriver as uc
-    CHROME_AVAILABLE = True
-except ImportError:
-    CHROME_AVAILABLE = False
-    logger.warning("undetected_chromedriver not available. Using mock mode.")
+def scrape_linkedin_rss(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
+    """Scrape LinkedIn jobs using RSS feed"""
+    try:
+        jobs = []
+        search_query = keyword.replace(' ', '%20')
+        
+        # LinkedIn RSS feed URL (this is a public endpoint)
+        rss_url = f"https://www.linkedin.com/jobs/search/?keywords={search_query}&format=rss"
+        
+        # Parse RSS feed
+        feed = feedparser.parse(rss_url)
+        
+        for entry in feed.entries[:max_jobs]:
+            try:
+                # Extract details from RSS entry
+                title = entry.get('title', '')
+                link = entry.get('link', '')
+                published = entry.get('published', '')
+                description = entry.get('description', '')
+                
+                # Extract company and location from description
+                company = 'Not specified'
+                location = 'Not specified'
+                
+                # Try to parse company and location from description
+                if description:
+                    # Look for common patterns in LinkedIn job descriptions
+                    company_match = re.search(r'Company:?\s*([^\n<]+)', description, re.IGNORECASE)
+                    location_match = re.search(r'Location:?\s*([^\n<]+)', description, re.IGNORECASE)
+                    
+                    if company_match:
+                        company = company_match.group(1).strip()
+                    if location_match:
+                        location = location_match.group(1).strip()
+                
+                jobs.append({
+                    'jobTitle': title,
+                    'company': company,
+                    'location': location,
+                    'experience': 'Not specified',
+                    'applyLink': link,
+                    'platform': 'LinkedIn',
+                    'published': published
+                })
+                
+            except Exception as e:
+                logger.warning(f"Error parsing RSS entry: {e}")
+                continue
+                
+        return jobs
+        
+    except Exception as e:
+        logger.error(f"RSS scraping failed: {e}")
+        return []
+
+def scrape_serpapi_alternative(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
+    """Alternative approach using HTTP requests (when RSS doesn't work)"""
+    try:
+        jobs = []
+        search_query = keyword.replace(' ', '%20')
+        url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query}"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for job cards - LinkedIn often changes these selectors
+            job_cards = soup.find_all('div', class_=lambda x: x and 'base-card' in x) or \
+                       soup.find_all('li', class_=lambda x: x and 'job' in x) or \
+                       soup.find_all('div', class_=lambda x: x and 'job' in x)
+            
+            for card in job_cards[:max_jobs]:
+                try:
+                    title_elem = card.find(['h3', 'h2', 'h4'], class_=lambda x: x and 'title' in str(x).lower())
+                    company_elem = card.find(['h4', 'h3', 'span'], class_=lambda x: x and 'company' in str(x).lower())
+                    location_elem = card.find(['span', 'div'], class_=lambda x: x and 'location' in str(x).lower())
+                    link_elem = card.find('a', href=True)
+                    
+                    title = title_elem.get_text(strip=True) if title_elem else 'Not specified'
+                    company = company_elem.get_text(strip=True) if company_elem else 'Not specified'
+                    location = location_elem.get_text(strip=True) if location_elem else 'Not specified'
+                    link = link_elem['href'] if link_elem else ''
+                    
+                    if link and link.startswith('/'):
+                        link = f"https://www.linkedin.com{link}"
+                    
+                    jobs.append({
+                        'jobTitle': title,
+                        'company': company,
+                        'location': location,
+                        'experience': 'Not specified',
+                        'applyLink': link,
+                        'platform': 'LinkedIn'
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error parsing job card: {e}")
+                    continue
+                    
+        return jobs
+        
+    except Exception as e:
+        logger.error(f"HTTP scraping failed: {e}")
+        return []
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "message": "LinkedIn Job Scraper API",
         "endpoints": {
-            "scrape_jobs": "/scrape/?keyword=your_keyword",
-            "health_check": "/health",
-            "info": "/info"
+            "scrape_jobs": "/scrape/?keyword=python",
+            "health_check": "/health"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy", "message": "API is running"}
-
-@app.get("/info")
-async def info():
-    """System information endpoint"""
-    return {
-        "chrome_available": CHROME_AVAILABLE,
-        "environment": os.getenv("ENVIRONMENT", "development")
-    }
 
 @app.get("/scrape/", response_model=List[Dict[str, Any]])
 async def scrape_data(keyword: str, max_jobs: int = 10):
     """
-    Scrape LinkedIn jobs for a given keyword
+    Scrape LinkedIn jobs using multiple approaches
+    Returns real data or empty array if all methods fail
     """
     if not keyword.strip():
         raise HTTPException(status_code=400, detail="Keyword cannot be empty")
     
-    # If Chrome is not available, return mock data for testing
-    if not CHROME_AVAILABLE:
-        logger.warning("Chrome driver not available - returning mock data")
-        return get_mock_data(keyword, max_jobs)
+    logger.info(f"Scraping jobs for: {keyword}")
     
-    logger.info(f"Starting scrape for keyword: {keyword}")
+    # Try RSS method first (most reliable for free tier)
+    jobs = scrape_linkedin_rss(keyword, max_jobs)
     
-    driver = None
-    try:
-        # Configure Chrome options for Render compatibility
-        options = uc.ChromeOptions()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-extensions')
-        options.add_argument('--remote-debugging-port=9222')
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
-        # Additional options for Render/Heroku
-        options.binary_location = os.getenv('GOOGLE_CHROME_BIN', '/usr/bin/google-chrome-stable')
-        
-        logger.info("Initializing Chrome driver...")
-        driver = uc.Chrome(
-            options=options,
-            use_subprocess=True,
-            headless=True
-        )
-        
-        # Rest of your scraping code remains the same...
-        linkedin_jobs = []
-        search_query = keyword.replace(' ', '%20')
-        linkedin_url = f"https://www.linkedin.com/jobs/search/?keywords={search_query}"
-        
-        logger.info(f"Navigating to: {linkedin_url}")
-        driver.get(linkedin_url)
-        time.sleep(5)
-        
-        # ... [rest of your scraping logic] ...
-        
-        # For now, let's return mock data to test the deployment
-        # In production, you'd use the actual scraping logic
-        return get_mock_data(keyword, max_jobs)
-        
-    except Exception as e:
-        logger.error(f"Error during scraping: {str(e)}")
-        # Fallback to mock data if scraping fails
-        return get_mock_data(keyword, max_jobs)
-        
-    finally:
-        if driver:
-            try:
-                driver.quit()
-                logger.info("Chrome driver closed successfully")
-            except Exception as e:
-                logger.warning(f"Error closing driver: {e}")
-
-def get_mock_data(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
-    """Return mock data for testing purposes"""
-    mock_jobs = [
-        {
-            'jobTitle': f'Senior {keyword} Developer',
-            'company': 'Tech Company Inc.',
-            'location': 'Remote',
-            'experience': '5+ years',
-            'applyLink': 'https://linkedin.com/jobs/view/12345',
-            'platform': 'LinkedIn'
-        },
-        {
-            'jobTitle': f'Junior {keyword} Engineer',
-            'company': 'Startup XYZ',
-            'location': 'New York, NY',
-            'experience': '1-3 years',
-            'applyLink': 'https://linkedin.com/jobs/view/67890',
-            'platform': 'LinkedIn'
-        },
-        {
-            'jobTitle': f'{keyword} Specialist',
-            'company': 'Enterprise Solutions',
-            'location': 'San Francisco, CA',
-            'experience': '3-5 years',
-            'applyLink': 'https://linkedin.com/jobs/view/54321',
-            'platform': 'LinkedIn'
-        }
-    ]
-    return mock_jobs[:max_jobs]
-
-@app.middleware("http")
-async def catch_exceptions_middleware(request, call_next):
-    try:
-        return await call_next(request)
-    except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error"}
-        )
+    # If RSS fails, try HTTP method
+    if not jobs:
+        jobs = scrape_serpapi_alternative(keyword, max_jobs)
+    
+    logger.info(f"Found {len(jobs)} jobs for '{keyword}'")
+    return jobs
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
