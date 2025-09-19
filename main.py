@@ -3,10 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
 from bs4 import BeautifulSoup
-import feedparser
 from typing import List, Dict, Any
 import logging
-import re
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -49,11 +48,10 @@ def scrape_linkedin_jobs(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any
         jobs = []
         search_query = keyword.replace(' ', '%20')
         
-        # Try multiple LinkedIn endpoints
+        # LinkedIn API endpoints that might work
         endpoints = [
             f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query}",
             f"https://www.linkedin.com/jobs/search/?keywords={search_query}",
-            f"https://www.linkedin.com/jobs-guest/jobs/api/jobPostings/{search_query}"
         ]
         
         headers = {
@@ -124,58 +122,10 @@ def scrape_linkedin_jobs(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any
                 logger.warning(f"Endpoint {endpoint} failed: {e}")
                 continue
         
-        # If all HTTP methods fail, try RSS
-        return scrape_linkedin_rss(keyword, max_jobs)
+        return []
         
     except Exception as e:
         logger.error(f"LinkedIn scraping failed: {e}")
-        return []
-
-def scrape_linkedin_rss(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
-    """Try LinkedIn RSS feed as fallback"""
-    try:
-        jobs = []
-        search_query = keyword.replace(' ', '%20')
-        rss_url = f"https://www.linkedin.com/jobs/search/?keywords={search_query}&format=rss"
-        
-        feed = feedparser.parse(rss_url)
-        
-        for entry in feed.entries[:max_jobs]:
-            try:
-                title = entry.get('title', '')
-                link = entry.get('link', '')
-                description = entry.get('description', '')
-                
-                # Extract company and location from description
-                company = 'Not specified'
-                location = 'Not specified'
-                
-                if description:
-                    company_match = re.search(r'Company:?\s*([^\n<]+)', description, re.IGNORECASE)
-                    location_match = re.search(r'Location:?\s*([^\n<]+)', description, re.IGNORECASE)
-                    
-                    if company_match:
-                        company = company_match.group(1).strip()
-                    if location_match:
-                        location = location_match.group(1).strip()
-                
-                jobs.append({
-                    'jobTitle': title,
-                    'company': company,
-                    'location': location,
-                    'experience': 'Not specified',
-                    'applyLink': link,
-                    'platform': 'LinkedIn'
-                })
-                
-            except Exception as e:
-                logger.warning(f"Error parsing RSS entry: {e}")
-                continue
-                
-        return jobs
-        
-    except Exception as e:
-        logger.error(f"RSS scraping failed: {e}")
         return []
 
 def scrape_github_jobs(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
@@ -205,6 +155,58 @@ def scrape_github_jobs(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]
         logger.error(f"GitHub Jobs API failed: {e}")
         return []
 
+def scrape_reed_jobs(keyword: str, max_jobs: int = 10) -> List[Dict[str, Any]]:
+    """Try Reed.co.uk public job search"""
+    try:
+        jobs = []
+        search_query = keyword.replace(' ', '+')
+        url = f"https://www.reed.co.uk/jobs/{search_query}-jobs"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            job_cards = soup.select('article.job-result-card, div.job-result, section.job-result')
+            
+            for card in job_cards[:max_jobs]:
+                try:
+                    title_elem = card.select_one('h2.title, h3.title, a[class*="title"]')
+                    company_elem = card.select_one('div.company, span.company, a[class*="company"]')
+                    location_elem = card.select_one('div.location, span.location, li.location')
+                    link_elem = card.select_one('a[href*="/jobs/"]')
+                    
+                    title = title_elem.get_text(strip=True) if title_elem else None
+                    company = company_elem.get_text(strip=True) if company_elem else None
+                    location = location_elem.get_text(strip=True) if location_elem else None
+                    link = link_elem.get('href') if link_elem else None
+                    
+                    if link and not link.startswith('http'):
+                        link = f"https://www.reed.co.uk{link}"
+                    
+                    if title and link:
+                        jobs.append({
+                            'jobTitle': title,
+                            'company': company or 'Not specified',
+                            'location': location or 'Not specified',
+                            'experience': 'Not specified',
+                            'applyLink': link,
+                            'platform': 'Reed'
+                        })
+                        
+                except Exception as e:
+                    logger.warning(f"Error parsing Reed job card: {e}")
+                    continue
+        
+        return jobs
+        
+    except Exception as e:
+        logger.error(f"Reed scraping failed: {e}")
+        return []
+
 @app.get("/scrape/", response_model=List[Dict[str, Any]])
 async def scrape_data(keyword: str, max_jobs: int = 10):
     """
@@ -219,9 +221,13 @@ async def scrape_data(keyword: str, max_jobs: int = 10):
     # Try LinkedIn scraping first
     jobs = scrape_linkedin_jobs(keyword, max_jobs)
     
-    # If LinkedIn fails, try GitHub Jobs as fallback
+    # If LinkedIn fails, try GitHub Jobs
     if not jobs:
         jobs = scrape_github_jobs(keyword, max_jobs)
+    
+    # If GitHub fails, try Reed
+    if not jobs:
+        jobs = scrape_reed_jobs(keyword, max_jobs)
     
     logger.info(f"Found {len(jobs)} jobs for '{keyword}'")
     return jobs
@@ -239,5 +245,6 @@ async def catch_exceptions_middleware(request, call_next):
 
 if __name__ == "__main__":
     import uvicorn
+    import os
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
